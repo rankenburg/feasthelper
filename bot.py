@@ -2,6 +2,9 @@ import csv
 import io
 import json
 import os
+import platform
+import socket
+import subprocess
 import time
 
 import aiohttp
@@ -92,6 +95,8 @@ EMOJI = {
     "Scott's Contact Baked In Bread": "<:Contact:1548241320538275840>",
     "Feast Baker Scott": "<:Feast_Baker_Scott:1548241340007976971>"
 }
+
+STARTED_AT = int(time.time())
 
 client = discord.Client(intents=discord.Intents.default())
 tree = app_commands.CommandTree(client)
@@ -411,6 +416,76 @@ async def kernels(interaction: discord.Interaction):
     lines.append("> Information sourced from [this spreadsheet](https://docs.google.com/spreadsheets/d/1nZI-4mNCymWb1pykwtnx--DnN_8NmEvSiDwwb9DGz8I/edit?usp=sharing)")
 
     await interaction.followup.send("\n".join(lines))
+
+def git_build():
+    """Short commit, branch, and whether the checkout has uncommitted edits.
+
+    Runs in whatever directory the bot was started from, which under systemd
+    is the WorkingDirectory, so it reports the checkout actually being run.
+    """
+    def run(*args):
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        return result.stdout.strip()
+
+    try:
+        commit = run("git", "rev-parse", "--short", "HEAD")
+        branch = run("git", "rev-parse", "--abbrev-ref", "HEAD")
+        edits = run("git", "status", "--porcelain")
+    except (OSError, subprocess.SubprocessError):
+        return "unknown, git not available"
+
+    if not commit:
+        return "unknown, not a checkout"
+
+    if edits:
+        return f"{commit} on {branch}, with uncommitted changes"
+    return f"{commit} on {branch}"
+
+
+async def ec2_zone():
+    """The AWS availability zone, or None anywhere else.
+
+    Amazon Linux requires IMDSv2, so a token has to be fetched first. Off EC2
+    that address goes nowhere, hence the short timeout and the catch.
+    """
+    connection = await open_session()
+    quick = aiohttp.ClientTimeout(total=2)
+
+    try:
+        async with connection.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+            timeout=quick,
+        ) as response:
+            token = await response.text()
+
+        async with connection.get(
+            "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+            headers={"X-aws-ec2-metadata-token": token},
+            timeout=quick,
+        ) as response:
+            return await response.text()
+    except (aiohttp.ClientError, TimeoutError):
+        return None
+
+
+@tree.command(name="version", description="Which copy of the bot answered this")
+async def version(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    zone = await ec2_zone()
+    if zone is None:
+        where = f"{platform.system()} {platform.release()}, not on EC2"
+    else:
+        where = f"AWS {zone}"
+
+    lines = [
+        f"**Build**: `{git_build()}`",
+        f"**Host**: `{socket.gethostname()}` ({where})",
+        f"**Started**: <t:{STARTED_AT}:R>",
+    ]
+    await interaction.followup.send('\n'.join(lines))
+
 
 @client.event
 async def on_ready():
